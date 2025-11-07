@@ -2,6 +2,7 @@ package com.jetbrains.websearch.service;
 
 import com.jetbrains.websearch.model.Plan;
 import com.jetbrains.websearch.model.Step;
+import com.jetbrains.websearch.model.StepResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
@@ -29,29 +30,45 @@ public class DeepSearchService {
     public String search(String query) throws IOException {
         Plan plan = searchPlannerService.makePlan(query);
 
-        String lastStepResult = "";
-        for (Step s: plan.planSteps()) {
+        String accumulatedResearch = "";
+        int stepCount = 0;
+        int maxSteps = 15; // Safety limit to prevent infinite loops
+
+        for (int i = 0; i < plan.planSteps().size() && stepCount < maxSteps; i++) {
+            Step currentStep = plan.planSteps().get(i);
+            stepCount++;
+
+            log.info("Executing step {}: {}", stepCount, currentStep.stepQuery());
+
             String webSearchResult = "";
-            if(s.searchNeeded()) {
-                webSearchResult = webSearchService.search(s.stepQuery());
+            if(currentStep.searchNeeded()) {
+                webSearchResult = webSearchService.search(currentStep.stepQuery());
             }
-            lastStepResult = executeStep(s, lastStepResult, webSearchResult);
+
+            StepResult result = executeStep(currentStep, accumulatedResearch, webSearchResult);
+            accumulatedResearch += "\n\n--- Step " + stepCount + " ---\n" + result.synthesis();
+
+            if (result.newSteps() != null && !result.newSteps().isEmpty()) {
+                log.info("Discovered {} new research steps", result.newSteps().size());
+                plan.planSteps().addAll(i + 1, result.newSteps());
+            }
         }
 
-        return lastStepResult;
+        return accumulatedResearch;
     }
 
-    private String executeStep(Step step, String previousStepResult, String webSearchResult) throws IOException {
+    private StepResult executeStep(Step step, String accumulatedResearch, String webSearchResult) throws IOException {
         log.info("Step: {} Search: {}", step.stepQuery(), step.searchNeeded());
         String systemPrompt = """
                 You are a deep research analyst executing a specific research step as part of a comprehensive investigation.
 
                 Your goal is to:
                 1. Understand the current step's objective
-                2. Review findings from the previous step (if available)
-                3. Analyze new search results (if web search is needed)
+                2. Review all accumulated research findings
+                3. Analyze new search results (if web search is performed)
                 4. Synthesize information to answer the step's specific query
                 5. Build a coherent narrative that connects to previous findings
+                6. Identify if NEW research steps are needed based on what you discover
 
                 Rules:
                 - Focus on the current step's specific question
@@ -62,47 +79,58 @@ public class DeepSearchService {
                 - Note any contradictions or gaps in information
                 - Maintain analytical objectivity
 
-                Output format:
-                A structured synthesis containing:
-                - Direct answer to the step's query
-                - Key findings and insights (2-4 bullet points)
-                - Connections to previous research
-                - Source citations when applicable
+                IMPORTANT - New Steps Discovery:
+                - Only suggest new steps if you discover critical information gaps or unexpected findings
+                - New steps should be highly specific and directly address the gap
+                - Limit to 1-2 new steps maximum
+                - Do NOT create new steps just to expand research - only when truly necessary
+                - If current findings are sufficient, leave newSteps empty
+
+                Output JSON format:
+                {
+                  "synthesis": "your detailed synthesis with citations",
+                  "newSteps": [
+                    {
+                      "stepQuery": "specific query for the gap discovered",
+                      "searchNeeded": true/false
+                    }
+                  ]
+                }
+
+                If no new steps are needed, use: "newSteps": []
                 """;
 
         String userMessage;
 
         if (step.searchNeeded()) {
-            // Perform web search and include results
             String searchResults = webSearchService.search(step.stepQuery());
 
             userMessage = String.format("""
                     CURRENT STEP QUERY: %s
 
-                    PREVIOUS STEP FINDINGS:
+                    ACCUMULATED RESEARCH:
                     %s
 
                     NEW SEARCH RESULTS:
                     %s
 
-                    Please synthesize the search results for this step, building upon previous findings.
+                    Synthesize the search results and identify any critical gaps requiring new research steps.
                     """,
                     step.stepQuery(),
-                    previousStepResult.isEmpty() ? "This is the first step - no previous findings." : previousStepResult,
+                    accumulatedResearch.isEmpty() ? "This is the first step - no previous findings." : accumulatedResearch,
                     searchResults
             );
         } else {
-            // Analysis/synthesis step without new search
             userMessage = String.format("""
                     CURRENT STEP (SYNTHESIS/ANALYSIS): %s
 
-                    ALL PREVIOUS FINDINGS:
+                    ACCUMULATED RESEARCH:
                     %s
 
-                    Please analyze and synthesize the accumulated research findings.
+                    Analyze and synthesize all accumulated findings. Identify any critical gaps requiring additional research.
                     """,
                     step.stepQuery(),
-                    previousStepResult.isEmpty() ? "No previous findings available." : previousStepResult
+                    accumulatedResearch.isEmpty() ? "No previous findings available." : accumulatedResearch
             );
         }
 
@@ -110,6 +138,6 @@ public class DeepSearchService {
                 .system(systemPrompt)
                 .user(userMessage)
                 .call()
-                .content();
+                .entity(StepResult.class);
     }
 }
